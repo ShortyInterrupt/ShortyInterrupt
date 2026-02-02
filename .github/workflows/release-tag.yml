@@ -19,16 +19,10 @@ jobs:
       - name: Validate required addon files exist
         run: |
           set -e
-          test -f "ShortyInterrupt/ShortyInterrupt.toc" || (echo "ERROR: ShortyInterrupt/ShortyInterrupt.toc not found" && exit 1)
-          test -f "ShortyInterrupt/ShortyInterrupt.lua" || (echo "ERROR: ShortyInterrupt/ShortyInterrupt.lua not found" && exit 1)
-
-          # Optional assets: include if you actually ship them
-          if [ -d "ShortyInterrupt/Media" ]; then
-            echo "Found ShortyInterrupt/Media/"
-          fi
-
-          # If you have a .blp icon and want it in the zip, enforce it here:
-          # test -f "ShortyInterrupt/ShortyInterrupt.blp" || (echo "ERROR: ShortyInterrupt/ShortyInterrupt.blp not found" && exit 1)
+          test -f "ShortyInterrupt.toc" || (echo "ERROR: ShortyInterrupt.toc not found at repo root" && exit 1)
+          test -f "ShortyInterrupt.lua" || (echo "ERROR: ShortyInterrupt.lua not found at repo root" && exit 1)
+          test -d "libs" || (echo "ERROR: libs/ folder not found at repo root" && exit 1)
+          test -f "ShortyInterrupt.blp" || (echo "ERROR: ShortyInterrupt.blp not found at repo root" && exit 1)
 
       - name: Set TOC version from tag
         run: |
@@ -36,15 +30,14 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"   # v0.1.6 -> 0.1.6
           echo "VER=${VER}" >> $GITHUB_ENV
 
-          TOC="ShortyInterrupt/ShortyInterrupt.toc"
-          if grep -qE '^## Version:' "$TOC"; then
-            sed -i "s/^## Version:.*/## Version: ${VER}/" "$TOC"
+          if grep -qE '^## Version:' ShortyInterrupt.toc; then
+            sed -i "s/^## Version:.*/## Version: ${VER}/" ShortyInterrupt.toc
           else
-            echo "## Version: ${VER}" >> "$TOC"
+            echo "## Version: ${VER}" >> ShortyInterrupt.toc
           fi
 
           echo "TOC version now:"
-          grep -E '^## Version:' "$TOC" || true
+          grep -E '^## Version:' ShortyInterrupt.toc || true
 
       - name: Stage addon payload (force ShortyInterrupt folder; exclude repo/dev files)
         run: |
@@ -52,8 +45,11 @@ jobs:
           rm -rf _stage
           mkdir -p _stage/ShortyInterrupt
 
-          # Copy ONLY what should ship (entire addon folder)
-          cp -a ShortyInterrupt/* _stage/ShortyInterrupt/
+          # Copy ONLY what should ship
+          cp -a libs _stage/ShortyInterrupt/
+          cp -a *.lua _stage/ShortyInterrupt/
+          cp -a ShortyInterrupt.toc _stage/ShortyInterrupt/
+          cp -a ShortyInterrupt.blp _stage/ShortyInterrupt/
 
           # Optional: strip OS junk if it exists
           find _stage -name ".DS_Store" -delete || true
@@ -72,7 +68,7 @@ jobs:
           (cd _stage && zip -r "../${ZIP_NAME}" ShortyInterrupt)
 
           echo "Zip listing:"
-          unzip -l "${ZIP_NAME}" | head -n 120
+          unzip -l "${ZIP_NAME}" | head -n 80
 
       - name: Create GitHub Release and upload zip
         uses: softprops/action-gh-release@v2

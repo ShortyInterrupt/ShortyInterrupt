@@ -1,9 +1,9 @@
 -- ShortyInterrupt - ui.lua
--- ShortyRCD-inspired minimalist UI:
+-- ShortyRCD-inspired minimalist UI (always show roster):
 --   | Interrupts ------------------------------|
 --   | [Icon][Player Name]----------------------|
---   | [Icon][Player Name]----------------------|
---   Progress bar + right-side seconds remaining.
+--   READY = full class-colored bar (no text)
+--   On cooldown = class-colored bar drains with seconds remaining.
 
 ShortyInterrupt_UI = ShortyInterrupt_UI or {}
 local UI = ShortyInterrupt_UI
@@ -104,7 +104,31 @@ local ICON_SZ = 16
 local BAR_H   = 16
 
 -- -----------------------
--- Roster -> class color mapping (like ShortyRCD)
+-- Interrupts indexed by class (built once)
+-- -----------------------
+UI.interruptsByClass = UI.interruptsByClass or nil
+
+local function BuildInterruptsByClass()
+  local map = {}
+  if not ShortyInterrupt_Interrupts then return map end
+
+  for spellID, e in pairs(ShortyInterrupt_Interrupts) do
+    if e and e.class then
+      map[e.class] = map[e.class] or {}
+      table.insert(map[e.class], spellID)
+    end
+  end
+
+  -- Stable ordering within class
+  for _, list in pairs(map) do
+    table.sort(list, function(a, b) return a < b end)
+  end
+
+  return map
+end
+
+-- -----------------------
+-- Roster -> class color mapping
 -- -----------------------
 UI.classByName = UI.classByName or {} -- [shortName] = classToken
 
@@ -144,6 +168,118 @@ function UI:GetClassColorForSender(sender)
     return c.r, c.g, c.b
   end
   return 0.32, 0.36, 0.42
+end
+
+-- -----------------------
+-- Build baseline rows: everyone + their class interrupt spell(s)
+-- -----------------------
+function UI:BuildRosterInterruptRows()
+  if not self.interruptsByClass then
+    self.interruptsByClass = BuildInterruptsByClass()
+  end
+
+  local out = {}
+  local seen = {}
+
+  local function AddMember(fullName, classToken, isPlayer)
+    if not fullName or not classToken then return end
+    local short = ShortName(fullName)
+    if not short then return end
+
+    -- Interrupt list for that class
+    local spellList = self.interruptsByClass[classToken]
+    if not spellList or #spellList == 0 then return end
+
+    for _, spellID in ipairs(spellList) do
+      -- For SELF only, filter by known spells (optional sanity)
+      if isPlayer then
+        local ok = true
+        if IsPlayerSpell then
+          ok = IsPlayerSpell(spellID) == true
+        elseif IsSpellKnown then
+          ok = IsSpellKnown(spellID) == true
+        end
+        if not ok then
+          -- Skip interrupts you don't have (e.g., hunter spec-specific)
+          goto continue_self
+        end
+      end
+
+      local key = short .. ":" .. tostring(spellID)
+      if not seen[key] then
+        seen[key] = true
+        out[#out + 1] = {
+          sender = short,
+          spellID = spellID,
+          classToken = classToken,
+        }
+      end
+
+      ::continue_self::
+    end
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      local unit = "raid" .. i
+      if UnitExists(unit) then
+        local full = UnitName(unit)
+        local _, classToken = UnitClass(unit)
+        AddMember(full, classToken, UnitIsUnit(unit, "player"))
+      end
+    end
+  elseif IsInGroup() then
+    do
+      local full = UnitName("player")
+      local _, classToken = UnitClass("player")
+      AddMember(full, classToken, true)
+    end
+    for i = 1, GetNumSubgroupMembers() do
+      local unit = "party" .. i
+      if UnitExists(unit) then
+        local full = UnitName(unit)
+        local _, classToken = UnitClass(unit)
+        AddMember(full, classToken, false)
+      end
+    end
+  else
+    local full = UnitName("player")
+    local _, classToken = UnitClass("player")
+    AddMember(full, classToken, true)
+  end
+
+  table.sort(out, function(a, b)
+    if a.sender ~= b.sender then return a.sender < b.sender end
+    return (a.spellID or 0) < (b.spellID or 0)
+  end)
+
+  return out
+end
+
+-- -----------------------
+-- Read current cooldown state from tracker (if present)
+-- -----------------------
+local function GetCooldownState(senderShort, spellID)
+  if not (ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.active) then
+    return nil
+  end
+
+  local spells = ShortyInterrupt_Tracker.active[senderShort]
+  if not spells then return nil end
+
+  local cd = spells[spellID]
+  if not cd then return nil end
+
+  local now = GetTime()
+  local remaining = (cd.expiresAt or 0) - now
+  if remaining <= 0 then
+    return nil
+  end
+
+  return {
+    duration = tonumber(cd.duration) or 0,
+    remaining = remaining,
+  }
 end
 
 -- -----------------------
@@ -227,6 +363,7 @@ function UI:Create()
     UI.accum = UI.accum + elapsed
     if UI.accum >= 0.10 then
       UI.accum = 0
+      -- Keep tracker tidy (expired cooldowns become READY/full bar)
       if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.PruneExpired then
         ShortyInterrupt_Tracker:PruneExpired()
       end
@@ -319,25 +456,23 @@ end
 -- -----------------------
 function UI:UpdateBoard()
   if not self.frame then return end
-  if not (ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.GetRows) then return end
+  if not ShortyInterrupt_Interrupts then return end
 
-  local rows = ShortyInterrupt_Tracker:GetRows()
+  -- Build baseline: everyone all the time
+  local rosterRows = self:BuildRosterInterruptRows()
 
-  -- Fit frame size to content (simple, no multi-column, super condensed)
   local maxW = GetMaxScreenWidth()
   local maxH = GetMaxScreenHeight()
 
   local desiredW = 260
-  local desiredH = 28 + 8 + PAD_B + math.max(1, #rows) * (ROW_H + GAP_Y)
+  local desiredH = 28 + 8 + PAD_B + math.max(1, #rosterRows) * (ROW_H + GAP_Y)
   desiredH = math.min(maxH, math.max(90, desiredH))
   desiredW = math.min(maxW, math.max(220, desiredW))
-
   self.frame:SetSize(desiredW, desiredH)
 
-  -- Render rows
   local y = 0
-  for i = 1, #rows do
-    local d = rows[i]
+  for i = 1, #rosterRows do
+    local d = rosterRows[i]
     local r = self:EnsureRow(i)
 
     r:ClearAllPoints()
@@ -348,10 +483,10 @@ function UI:UpdateBoard()
     local sender = d.sender or "?"
     local cr, cg, cb = self:GetClassColorForSender(sender)
     local senderHex = RGBToHex(cr, cg, cb)
-    local senderText = ("|cff%s%s|r"):format(senderHex, ShortName(sender) or sender)
+    local senderText = ("|cff%s%s|r"):format(senderHex, sender)
 
-    -- Icon from interrupt library
-    local entry = ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[d.spellID]
+    -- Icon for this interrupt spell
+    local entry = ShortyInterrupt_Interrupts[d.spellID]
     local iconID = entry and entry.iconID
     if iconID then
       r.icon:SetTexture(iconID)
@@ -359,53 +494,56 @@ function UI:UpdateBoard()
       r.icon:SetTexture("Interface/Icons/INV_Misc_QuestionMark")
     end
 
-    -- Progress: show remaining fraction (like ShortyRCD cooldown state)
-    -- Here: progress = remaining / total (1 -> 0)
-    local total = tonumber(d.duration) or 1
-    local remaining = tonumber(d.remaining) or 0
-    local progress = 0
-    if total > 0 then
+    -- Determine cooldown state: if none => READY/full bar
+    local st = GetCooldownState(sender, d.spellID)
+
+    local progress = 1
+    local remaining = 0
+    local total = 1
+
+    if st then
+      total = st.duration > 0 and st.duration or 1
+      remaining = st.remaining > 0 and st.remaining or 0
+      -- "Drains" as remaining decreases: 1 -> 0
       progress = math.max(0, math.min(1, remaining / total))
+    else
+      progress = 1
     end
 
     r.bar:SetMinMaxValues(0, 1)
     r.bar:SetValue(progress)
 
-    -- Color: full class color (like ShortyRCD minimalist interrupt bars)
+    -- Full class color always
     r.bar:SetStatusBarColor(cr, cg, cb, 0.90)
 
     r.label:SetText(senderText)
     r.label:SetTextColor(0.78, 0.80, 0.84, 1.0)
 
-    -- Keep countdown numbers (screenshot shows them). Full bar = visually "ready".
-    r.timer:SetText(FormatTime(remaining))
-    r.timer:SetTextColor(0.90, 0.92, 0.96, 1.0)
-
+    if st then
+      r.timer:SetText(FormatTime(remaining))
+      r.timer:SetTextColor(0.90, 0.92, 0.96, 1.0)
+    else
+      -- READY: full bar, no text
+      r.timer:SetText("")
+    end
 
     r:Show()
     y = y + ROW_H + GAP_Y
   end
 
-  if #rows == 0 then
-    -- Show a single empty placeholder row (subtle)
+  if #rosterRows == 0 then
+    -- Solo edge case (shouldn't happen, but safe)
     local r = self:EnsureRow(1)
-    r:ClearAllPoints()
-    r:SetPoint("TOPLEFT", self.list, "TOPLEFT", 0, 0)
-    r:SetPoint("TOPRIGHT", self.list, "TOPRIGHT", 0, 0)
-    r:SetHeight(ROW_H)
-
     r.icon:SetTexture("Interface/Icons/INV_Misc_QuestionMark")
     r.bar:SetMinMaxValues(0, 1)
     r.bar:SetValue(1)
     r.bar:SetStatusBarColor(0.12, 0.14, 0.18, 0.65)
-
-    r.label:SetText("|cffcfd8dcNo active interrupts|r")
+    r.label:SetText("|cffcfd8dcNo roster|r")
     r.timer:SetText("")
     r:Show()
-
     self:HideExtraRows(2)
   else
-    self:HideExtraRows(#rows + 1)
+    self:HideExtraRows(#rosterRows + 1)
   end
 end
 
@@ -415,7 +553,7 @@ function UI:Refresh()
 end
 
 -- -----------------------
--- Position save/restore (matches your ShortyInterruptDB.ui fields)
+-- Position save/restore
 -- -----------------------
 function UI:SavePosition()
   if not self.frame then return end
@@ -458,7 +596,6 @@ function UI:ApplyLockState()
   self.frame:EnableMouse(not locked)
 
   if locked then
-    -- Transparent container/header/title
     self.frame:SetBackdropColor(0.07, 0.08, 0.10, 0.00)
     self.frame:SetBackdropBorderColor(0.12, 0.13, 0.16, 0.00)
 

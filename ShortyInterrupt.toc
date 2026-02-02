@@ -1,0 +1,13 @@
+## Interface: 120000
+## Title: ShortyInterrupt
+## Notes: Broadcast-only interrupt tracker (no Blizzard cooldown API sampling)
+## Author: Jon
+## Version: 0.1.0
+## SavedVariables: ShortyInterruptDB
+
+interrupt_library.lua
+tracker.lua
+comms.lua
+ui.lua
+options.lua
+ShortyInterrupt.lua

@@ -20,6 +20,24 @@ local function EnsureDB()
   return ui
 end
 
+local function RegisterOptionsPanel(panel, name)
+  -- Retail / modern client (Dragonflight+ / 10.0+ / 12.0+)
+  if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
+    local category = Settings.RegisterCanvasLayoutCategory(panel, name or panel.name or "ShortyInterrupt")
+    Settings.RegisterAddOnCategory(category)
+    return
+  end
+
+  -- Legacy fallback
+  if InterfaceOptions_AddCategory then
+    InterfaceOptions_AddCategory(panel)
+    return
+  end
+
+  -- If neither exists, just do nothing (panel won't be accessible, but addon won't error)
+end
+
+
 local function ApplyFramePosition()
   if not (ShortyInterrupt_UI and ShortyInterrupt_UI.frame) then return end
 
@@ -52,7 +70,7 @@ function ShortyInterrupt_Options:CreatePanel()
   if self.panel then return end
   EnsureDB()
 
-  local p = CreateFrame("Frame", "ShortyInterruptOptionsPanel", InterfaceOptionsFramePanelContainer)
+  local p = CreateFrame("Frame", "ShortyInterruptOptionsPanel", UIParent)
   p.name = "ShortyInterrupt"
 
   local title = p:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
@@ -104,6 +122,6 @@ function ShortyInterrupt_Options:CreatePanel()
   hint:SetPoint("TOPLEFT", reset, "BOTTOMLEFT", 0, -10)
   hint:SetText("Tip: Use 'Test Bars' to verify the UI without casting an interrupt.")
 
-  InterfaceOptions_AddCategory(p)
+  RegisterOptionsPanel(p, "ShortyInterrupt")
   self.panel = p
 end

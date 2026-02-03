@@ -191,6 +191,8 @@ function UI:BuildRosterInterruptRows()
     if not spellList or #spellList == 0 then return end
 
     for _, spellID in ipairs(spellList) do
+      local shouldAdd = true
+    
       -- For SELF only, filter by known spells (optional sanity)
       if isPlayer then
         local ok = true
@@ -199,23 +201,24 @@ function UI:BuildRosterInterruptRows()
         elseif IsSpellKnown then
           ok = IsSpellKnown(spellID) == true
         end
+    
         if not ok then
           -- Skip interrupts you don't have (e.g., hunter spec-specific)
-          goto continue_self
+          shouldAdd = false
         end
       end
-
-      local key = short .. ":" .. tostring(spellID)
-      if not seen[key] then
-        seen[key] = true
-        out[#out + 1] = {
-          sender = short,
-          spellID = spellID,
-          classToken = classToken,
-        }
+    
+      if shouldAdd then
+        local key = short .. ":" .. tostring(spellID)
+        if not seen[key] then
+          seen[key] = true
+          out[#out + 1] = {
+            sender = short,
+            spellID = spellID,
+            classToken = classToken,
+          }
+        end
       end
-
-      ::continue_self::
     end
   end
 

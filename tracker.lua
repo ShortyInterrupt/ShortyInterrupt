@@ -10,7 +10,13 @@ ShortyInterrupt_Tracker = {
 }
 
 local function SenderKey(sender)
-  return sender or "UNKNOWN"
+  if not sender or sender == "" then return "UNKNOWN" end
+  -- Normalize "Name-Realm" -> "Name" so UI lookups using UnitName() match.
+  local dash = string.find(sender, "-", 1, true)
+  if dash then
+    return string.sub(sender, 1, dash - 1)
+  end
+  return sender
 end
 
 -- Start (or restart) a cooldown timer for sender + spell.

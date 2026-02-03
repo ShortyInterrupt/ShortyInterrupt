@@ -262,7 +262,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
     if name ~= ADDON then return end
 
     EnsureDB()
-    math.randomseed(time())
+    -- math.randomseed(time())
 
     ShortyInterrupt_Comms:Init()
     ShortyInterrupt_Comms:SetPresenceAckHandler(OnPresenceAck)
@@ -284,7 +284,14 @@ frame:SetScript("OnEvent", function(_, event, ...)
     end
 
   elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
-    OnPlayerSpellcastSucceeded(...)
+    -- Modern signature: unit, castGUID, spellID, spellName
+    local unit, castGUID, spellID = ...
+    if unit ~= "player" then return end
+    if not spellID then return end
+
+    -- Call your existing function with the correct args order
+    -- If your OnPlayerSpellcastSucceeded expects (unit, castGUID, spellID)
+    OnPlayerSpellcastSucceeded(unit, castGUID, spellID)
 
   elseif event == "CHAT_MSG_ADDON" then
     OnAddonMessage(...)
@@ -293,5 +300,69 @@ frame:SetScript("OnEvent", function(_, event, ...)
     HandleGroupRosterUpdate()
   end
 end)
+
+
+-- ======================
+-- Slash Commands
+-- ======================
+
+SLASH_SHORTYINT1 = "/shortyint"
+SLASH_SHORTYINT2 = "/sint"
+
+SlashCmdList["SHORTYINT"] = function(msg)
+  msg = msg and msg:lower():trim() or ""
+
+  if msg == "" or msg == "help" then
+    print("|cffffcc00ShortyInterrupt commands:|r")
+    print("/shortyint lock   - Lock frame")
+    print("/shortyint unlock - Unlock frame")
+    print("/shortyint reset  - Reset frame position")
+    print("/shortyint clear  - Clear active timers")
+    return
+  end
+
+  if msg == "lock" then
+    ShortyInterruptDB.ui.locked = true
+    if ShortyInterrupt_UI then
+      ShortyInterrupt_UI:SetLocked(true)
+    end
+    print("ShortyInterrupt: frame locked")
+    return
+  end
+
+  if msg == "unlock" then
+    ShortyInterruptDB.ui.locked = false
+    if ShortyInterrupt_UI then
+      ShortyInterrupt_UI:SetLocked(false)
+    end
+    print("ShortyInterrupt: frame unlocked")
+    return
+  end
+
+  if msg == "reset" then
+    ShortyInterruptDB.ui.point = "CENTER"
+    ShortyInterruptDB.ui.relPoint = "CENTER"
+    ShortyInterruptDB.ui.x = 0
+    ShortyInterruptDB.ui.y = 0
+
+    if ShortyInterrupt_UI and ShortyInterrupt_UI.frame then
+      local f = ShortyInterrupt_UI.frame
+      f:ClearAllPoints()
+      f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    end
+
+    print("ShortyInterrupt: frame position reset")
+    return
+  end
+
+  if msg == "clear" then
+    ShortyInterrupt_Tracker:ClearAll()
+    print("ShortyInterrupt: timers cleared")
+    return
+  end
+
+  print("ShortyInterrupt: unknown command. Type /shortyint help")
+end
+
 
 frame:RegisterEvent("ADDON_LOADED")

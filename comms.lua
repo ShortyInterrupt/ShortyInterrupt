@@ -18,16 +18,15 @@ ShortyInterrupt_Comms = {
   _onPresenceAck = nil,
 }
 
-local function GetGroupChannel()
-  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
-    return "INSTANCE_CHAT"
-  end
-  if IsInRaid() then
-    return "RAID"
-  end
-  if IsInGroup() then
-    return "PARTY"
-  end
+-- ==========================================
+-- Helpers
+-- ==========================================
+local function AllowedChannel()
+  -- Match ShortyRCD behavior exactly:
+  -- Instance groups (LFG/Mythic+/LFR) use INSTANCE_CHAT. Raids use RAID.
+  if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+  if IsInRaid() then return "RAID" end
+  if IsInGroup() then return "PARTY" end
   return nil
 end
 
@@ -42,8 +41,26 @@ local function FullPlayerName()
   return name
 end
 
+local function SendToGroup(msg)
+  local ch = AllowedChannel()
+  if not ch then return end
+  if not C_ChatInfo or not C_ChatInfo.SendAddonMessage then return end
+
+  -- Prefer ChatThrottleLib if present (like ShortyRCD)
+  if ChatThrottleLib and ChatThrottleLib.SendAddonMessage then
+    ChatThrottleLib:SendAddonMessage("NORMAL", ShortyInterrupt_Comms.PREFIX, msg, ch)
+  else
+    C_ChatInfo.SendAddonMessage(ShortyInterrupt_Comms.PREFIX, msg, ch)
+  end
+end
+
+-- ==========================================
+-- Init / handlers
+-- ==========================================
 function ShortyInterrupt_Comms:Init()
-  C_ChatInfo.RegisterAddonMessagePrefix(self.PREFIX)
+  if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+    C_ChatInfo.RegisterAddonMessagePrefix(self.PREFIX)
+  end
 end
 
 function ShortyInterrupt_Comms:SetPresenceAckHandler(fn)
@@ -54,35 +71,36 @@ end
 -- Interrupt broadcast
 -- =========================
 function ShortyInterrupt_Comms:BroadcastInterrupt(spellID, cdSeconds)
-  local channel = GetGroupChannel()
-  if not channel then return end
-
   spellID = tonumber(spellID)
   cdSeconds = tonumber(cdSeconds)
   if not spellID or not cdSeconds or cdSeconds <= 0 then return end
 
   local msg = string.format("I|%d|%d|%d", self.VERSION, spellID, cdSeconds)
-  C_ChatInfo.SendAddonMessage(self.PREFIX, msg, channel)
+  SendToGroup(msg)
 end
 
 -- =========================
 -- Presence handshake
 -- =========================
 function ShortyInterrupt_Comms:BroadcastPresenceQuery(requestID)
-  local channel = GetGroupChannel()
-  if not channel then return end
   if not requestID or requestID == "" then return end
-
   local msg = string.format("Q|%d|%s", self.VERSION, requestID)
-  C_ChatInfo.SendAddonMessage(self.PREFIX, msg, channel)
+  SendToGroup(msg)
 end
 
 function ShortyInterrupt_Comms:SendPresenceAck(toPlayer, requestID)
   if not toPlayer or toPlayer == "" then return end
   if not requestID or requestID == "" then return end
+  if not C_ChatInfo or not C_ChatInfo.SendAddonMessage then return end
 
   local msg = string.format("A|%d|%s", self.VERSION, requestID)
-  C_ChatInfo.SendAddonMessage(self.PREFIX, msg, "WHISPER", toPlayer)
+
+  -- Prefer ChatThrottleLib here too (safe), otherwise direct whisper
+  if ChatThrottleLib and ChatThrottleLib.SendAddonMessage then
+    ChatThrottleLib:SendAddonMessage("NORMAL", self.PREFIX, msg, "WHISPER", toPlayer)
+  else
+    C_ChatInfo.SendAddonMessage(self.PREFIX, msg, "WHISPER", toPlayer)
+  end
 end
 
 -- =========================
@@ -93,9 +111,14 @@ function ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
   if type(msg) ~= "string" or msg == "" then return end
   if not sender or sender == "" then return end
 
+  -- IMPORTANT:
+  -- Do NOT restrict channels here. Presence ACK arrives via WHISPER.
+  -- ShortyRCD filters channels because it does not use WHISPER for protocol messages.
+
+  -- Ignore self (handle both full and short forms)
   local myFull = FullPlayerName()
-  if myFull and sender == myFull then
-    -- Ignore self
+  local myShort = UnitName("player")
+  if (myFull and sender == myFull) or (myShort and sender == myShort) then
     return
   end
 

@@ -1,15 +1,21 @@
 -- ShortyInterrupt - ui.lua
--- ShortyRCD-inspired minimalist UI (always show roster):
---   | Interrupts ------------------------------|
---   | [Icon][Player Name]----------------------|
---   READY = full class-colored bar (no text)
---   On cooldown = class-colored bar drains with seconds remaining.
+-- ShortyRCD-inspired minimalist UI.
+--
+-- Model B visibility:
+--   - Only show confirmed addon users
+--   - Plus a short pending grace window during presence check
+--
+-- Hunter:
+--   - Default to Counter Shot unless we KNOW they have Muzzle (via capability broadcast)
+--
+-- Raid/LFR:
+--   - Hide UI completely in any raid group (ShortyRCD owns raid-scale tracking)
 
 ShortyInterrupt_UI = ShortyInterrupt_UI or {}
 local UI = ShortyInterrupt_UI
 
 -- -----------------------
--- Helpers (mirrors ShortyRCD style)
+-- Helpers
 -- -----------------------
 local function ShortName(nameWithRealm)
   if type(nameWithRealm) ~= "string" then return nameWithRealm end
@@ -41,6 +47,10 @@ local function RGBToHex(r, g, b)
     math.floor(g*255 + 0.5),
     math.floor(b*255 + 0.5)
   )
+end
+
+local function IsRaidContext()
+  return IsInRaid() == true
 end
 
 -- Preferred UI font (Expressway). Place at:
@@ -92,7 +102,7 @@ local function GetMaxScreenHeight()
 end
 
 -- -----------------------
--- Layout constants (match ShortyRCD compact rows)
+-- Layout constants
 -- -----------------------
 local ROW_H   = 18
 local GAP_Y   = 3
@@ -104,7 +114,7 @@ local ICON_SZ = 16
 local BAR_H   = 16
 
 -- -----------------------
--- Interrupts indexed by class (built once)
+-- Interrupts indexed by class
 -- -----------------------
 UI.interruptsByClass = UI.interruptsByClass or nil
 
@@ -119,7 +129,6 @@ local function BuildInterruptsByClass()
     end
   end
 
-  -- Stable ordering within class
   for _, list in pairs(map) do
     table.sort(list, function(a, b) return a < b end)
   end
@@ -171,7 +180,19 @@ function UI:GetClassColorForSender(sender)
 end
 
 -- -----------------------
--- Build baseline rows: everyone + their class interrupt spell(s)
+-- Model B presence gating
+-- -----------------------
+local function ShouldShowByPresence(short, fullGuess, isPlayer)
+  if isPlayer then return true end
+  if IsRaidContext() then return false end
+  if ShortyInterrupt and ShortyInterrupt.ShouldShowSender then
+    return ShortyInterrupt:ShouldShowSender(short, fullGuess)
+  end
+  return false
+end
+
+-- -----------------------
+-- Build rows
 -- -----------------------
 function UI:BuildRosterInterruptRows()
   if not self.interruptsByClass then
@@ -181,19 +202,67 @@ function UI:BuildRosterInterruptRows()
   local out = {}
   local seen = {}
 
+  local function AddRow(short, classToken, spellID)
+    local key = short .. ":" .. tostring(spellID)
+    if seen[key] then return end
+    seen[key] = true
+    out[#out + 1] = { sender = short, spellID = spellID, classToken = classToken }
+  end
+
+  local HUNTER_COUNTERSHOT = 147362
+  local HUNTER_MUZZLE      = 187707
+
   local function AddMember(fullName, classToken, isPlayer)
     if not fullName or not classToken then return end
     local short = ShortName(fullName)
     if not short then return end
 
-    -- Interrupt list for that class
+    if not ShouldShowByPresence(short, fullName, isPlayer) then
+      return
+    end
+
+    -- Capabilities-driven spell selection
+    local caps = nil
+    if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.GetCapabilities then
+      caps = ShortyInterrupt_Tracker:GetCapabilities(short)
+    end
+
+    if caps then
+      if classToken == "HUNTER" then
+        if caps[HUNTER_MUZZLE] then
+          AddRow(short, classToken, HUNTER_MUZZLE)
+          return
+        end
+        if caps[HUNTER_COUNTERSHOT] then
+          AddRow(short, classToken, HUNTER_COUNTERSHOT)
+          return
+        end
+        -- fall through to default if somehow empty
+      else
+        for spellID in pairs(caps) do
+          if ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[spellID] then
+            AddRow(short, classToken, spellID)
+          end
+        end
+        return
+      end
+    end
+
+    -- No caps yet:
+    if classToken == "HUNTER" then
+      -- Default: only Counter Shot unless we know Muzzle
+      AddRow(short, classToken, HUNTER_COUNTERSHOT)
+      return
+    end
+
+    -- Non-hunter: only show if unambiguous
     local spellList = self.interruptsByClass[classToken]
     if not spellList or #spellList == 0 then return end
 
-    for _, spellID in ipairs(spellList) do
-      local shouldAdd = true
-    
-      -- For SELF only, filter by known spells (optional sanity)
+    if #spellList == 1 then
+      local spellID = spellList[1]
+
+      -- For SELF only, optional sanity filter by known spells
       if isPlayer then
         local ok = true
         if IsPlayerSpell then
@@ -201,36 +270,19 @@ function UI:BuildRosterInterruptRows()
         elseif IsSpellKnown then
           ok = IsSpellKnown(spellID) == true
         end
-    
-        if not ok then
-          -- Skip interrupts you don't have (e.g., hunter spec-specific)
-          shouldAdd = false
-        end
+        if not ok then return end
       end
-    
-      if shouldAdd then
-        local key = short .. ":" .. tostring(spellID)
-        if not seen[key] then
-          seen[key] = true
-          out[#out + 1] = {
-            sender = short,
-            spellID = spellID,
-            classToken = classToken,
-          }
-        end
-      end
+
+      AddRow(short, classToken, spellID)
+      return
     end
+
+    -- Ambiguous non-hunter: don't guess
+    return
   end
 
   if IsInRaid() then
-    for i = 1, GetNumGroupMembers() do
-      local unit = "raid" .. i
-      if UnitExists(unit) then
-        local full = UnitName(unit)
-        local _, classToken = UnitClass(unit)
-        AddMember(full, classToken, UnitIsUnit(unit, "player"))
-      end
-    end
+    return out
   elseif IsInGroup() then
     do
       local full = UnitName("player")
@@ -260,7 +312,7 @@ function UI:BuildRosterInterruptRows()
 end
 
 -- -----------------------
--- Read current cooldown state from tracker (if present)
+-- Read cooldown state from tracker
 -- -----------------------
 local function GetCooldownState(senderShort, spellID)
   if not (ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.active) then
@@ -279,14 +331,11 @@ local function GetCooldownState(senderShort, spellID)
     return nil
   end
 
-  return {
-    duration = tonumber(cd.duration) or 0,
-    remaining = remaining,
-  }
+  return { duration = tonumber(cd.duration) or 0, remaining = remaining }
 end
 
 -- -----------------------
--- Frame creation (ShortyRCD theme)
+-- Frame creation
 -- -----------------------
 function UI:Create()
   if self.frame then return end
@@ -349,7 +398,6 @@ function UI:Create()
   self:RestorePosition()
   self:ApplyLockState()
 
-  -- Keep roster colors fresh
   f:SetScript("OnEvent", function(_, event)
     if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
       UI:RefreshRosterClasses()
@@ -360,13 +408,11 @@ function UI:Create()
 
   self:RefreshRosterClasses()
 
-  -- Tick UI (like ShortyRCD: 0.10s)
   self.accum = 0
   f:SetScript("OnUpdate", function(_, elapsed)
     UI.accum = UI.accum + elapsed
     if UI.accum >= 0.10 then
       UI.accum = 0
-      -- Keep tracker tidy (expired cooldowns become READY/full bar)
       if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.PruneExpired then
         ShortyInterrupt_Tracker:PruneExpired()
       end
@@ -376,7 +422,7 @@ function UI:Create()
 end
 
 -- -----------------------
--- Row pool (matches ShortyRCD item row style)
+-- Row pool
 -- -----------------------
 function UI:EnsureRow(i)
   if self.rows[i] then return self.rows[i] end
@@ -385,7 +431,6 @@ function UI:EnsureRow(i)
   local r = CreateFrame("Frame", nil, parent)
   r:SetSize(220, ROW_H)
 
-  -- background (item)
   local bg = CreateFrame("Frame", nil, r, "BackdropTemplate")
   bg:SetPoint("TOPLEFT", r, "TOPLEFT", 0, 0)
   bg:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", 0, 0)
@@ -398,13 +443,11 @@ function UI:EnsureRow(i)
   bg:SetBackdropColor(0.05, 0.06, 0.08, 0.55)
   bg:SetBackdropBorderColor(0.12, 0.13, 0.16, 0.9)
 
-  -- icon
   local icon = r:CreateTexture(nil, "ARTWORK")
   icon:SetSize(ICON_SZ, ICON_SZ)
   icon:SetPoint("LEFT", r, "LEFT", 4, 0)
   icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-  -- bar background
   local barBG = CreateFrame("Frame", nil, r, "BackdropTemplate")
   barBG:SetPoint("LEFT", icon, "RIGHT", 6, 0)
   barBG:SetPoint("RIGHT", r, "RIGHT", -4, 0)
@@ -461,7 +504,13 @@ function UI:UpdateBoard()
   if not self.frame then return end
   if not ShortyInterrupt_Interrupts then return end
 
-  -- Build baseline: everyone all the time
+  if IsRaidContext() then
+    self.frame:Hide()
+    return
+  else
+    self.frame:Show()
+  end
+
   local rosterRows = self:BuildRosterInterruptRows()
 
   local maxW = GetMaxScreenWidth()
@@ -488,7 +537,6 @@ function UI:UpdateBoard()
     local senderHex = RGBToHex(cr, cg, cb)
     local senderText = ("|cff%s%s|r"):format(senderHex, sender)
 
-    -- Icon for this interrupt spell
     local entry = ShortyInterrupt_Interrupts[d.spellID]
     local iconID = entry and entry.iconID
     if iconID then
@@ -497,7 +545,6 @@ function UI:UpdateBoard()
       r.icon:SetTexture("Interface/Icons/INV_Misc_QuestionMark")
     end
 
-    -- Determine cooldown state: if none => READY/full bar
     local st = GetCooldownState(sender, d.spellID)
 
     local progress = 1
@@ -507,16 +554,11 @@ function UI:UpdateBoard()
     if st then
       total = st.duration > 0 and st.duration or 1
       remaining = st.remaining > 0 and st.remaining or 0
-      -- "Drains" as remaining decreases: 1 -> 0
       progress = math.max(0, math.min(1, remaining / total))
-    else
-      progress = 1
     end
 
     r.bar:SetMinMaxValues(0, 1)
     r.bar:SetValue(progress)
-
-    -- Full class color always
     r.bar:SetStatusBarColor(cr, cg, cb, 0.90)
 
     r.label:SetText(senderText)
@@ -526,7 +568,6 @@ function UI:UpdateBoard()
       r.timer:SetText(FormatTime(remaining))
       r.timer:SetTextColor(0.90, 0.92, 0.96, 1.0)
     else
-      -- READY: full bar, no text
       r.timer:SetText("")
     end
 
@@ -535,13 +576,12 @@ function UI:UpdateBoard()
   end
 
   if #rosterRows == 0 then
-    -- Solo edge case (shouldn't happen, but safe)
     local r = self:EnsureRow(1)
     r.icon:SetTexture("Interface/Icons/INV_Misc_QuestionMark")
     r.bar:SetMinMaxValues(0, 1)
     r.bar:SetValue(1)
     r.bar:SetStatusBarColor(0.12, 0.14, 0.18, 0.65)
-    r.label:SetText("|cffcfd8dcNo roster|r")
+    r.label:SetText("|cffcfd8dcNo tracked players|r")
     r.timer:SetText("")
     r:Show()
     self:HideExtraRows(2)
@@ -583,7 +623,7 @@ function UI:RestorePosition()
 end
 
 -- -----------------------
--- Locking (mimic ShortyRCD minimalist/locked behavior)
+-- Locking
 -- -----------------------
 function UI:SetLocked(locked)
   local db = EnsureDB()

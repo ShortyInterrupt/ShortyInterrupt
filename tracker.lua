@@ -3,10 +3,13 @@
 --   - from your own casts (ShortyInterrupt.lua)
 --   - from received addon broadcasts (comms.lua)
 --
+-- Also stores remote capability lists (what interrupts each player actually has).
+--
 -- No Blizzard cooldown APIs. Pure GetTime() math.
 
 ShortyInterrupt_Tracker = {
-  active = {}, -- [sender] = { [spellID] = { startAt=number, duration=number, expiresAt=number } }
+  active = {},        -- [senderShort] = { [spellID] = { startAt=number, duration=number, expiresAt=number } }
+  capabilities = {},  -- [senderShort] = { [spellID] = true }
 }
 
 local function SenderKey(sender)
@@ -57,9 +60,10 @@ function ShortyInterrupt_Tracker:PruneExpired()
   end
 end
 
--- Clears all timers (e.g., when leaving group).
+-- Clears all timers + capabilities (e.g., when leaving group).
 function ShortyInterrupt_Tracker:ClearAll()
   wipe(self.active)
+  wipe(self.capabilities)
 
   if ShortyInterrupt_UI and ShortyInterrupt_UI.Refresh then
     ShortyInterrupt_UI:Refresh()
@@ -69,6 +73,35 @@ end
 -- Returns raw active table (sender->spell->timer)
 function ShortyInterrupt_Tracker:GetActive()
   return self.active
+end
+
+-- =========================
+-- Capabilities (ShortyRCD-style)
+-- =========================
+function ShortyInterrupt_Tracker:SetRemoteCapabilities(sender, spellIDs)
+  if not sender or sender == "" then return end
+  local key = SenderKey(sender)
+
+  self.capabilities[key] = self.capabilities[key] or {}
+  wipe(self.capabilities[key])
+
+  if type(spellIDs) == "table" then
+    for i = 1, #spellIDs do
+      local id = tonumber(spellIDs[i])
+      if id then
+        self.capabilities[key][id] = true
+      end
+    end
+  end
+
+  if ShortyInterrupt_UI and ShortyInterrupt_UI.Refresh then
+    ShortyInterrupt_UI:Refresh()
+  end
+end
+
+function ShortyInterrupt_Tracker:GetCapabilities(sender)
+  local key = SenderKey(sender)
+  return self.capabilities[key]
 end
 
 -- Utility: Flatten active timers into a sorted array (useful for UI)

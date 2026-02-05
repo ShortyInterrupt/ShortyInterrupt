@@ -1,8 +1,10 @@
 -- ShortyInterrupt - comms.lua
--- Broadcast-only interrupt tracking via addon messages + presence handshake.
+-- Broadcast-only interrupt tracking via addon messages + presence handshake + capabilities.
 --
 -- Message types:
 --   I|v|spellID|cd          (interrupt broadcast)
+--   L|v|csvSpellIDs         (capabilities list: interrupts I actually have)
+--   R|v                     (request capabilities rebroadcast)
 --   Q|v|requestID           (presence query)
 --   A|v|requestID           (presence ack, whispered back to requester)
 --
@@ -54,6 +56,17 @@ local function SendToGroup(msg)
   end
 end
 
+local function SendWhisper(msg, toPlayer)
+  if not toPlayer or toPlayer == "" then return end
+  if not C_ChatInfo or not C_ChatInfo.SendAddonMessage then return end
+
+  if ChatThrottleLib and ChatThrottleLib.SendAddonMessage then
+    ChatThrottleLib:SendAddonMessage("NORMAL", ShortyInterrupt_Comms.PREFIX, msg, "WHISPER", toPlayer)
+  else
+    C_ChatInfo.SendAddonMessage(ShortyInterrupt_Comms.PREFIX, msg, "WHISPER", toPlayer)
+  end
+end
+
 -- ==========================================
 -- Init / handlers
 -- ==========================================
@@ -80,6 +93,33 @@ function ShortyInterrupt_Comms:BroadcastInterrupt(spellID, cdSeconds)
 end
 
 -- =========================
+-- Capabilities (ShortyRCD-style)
+-- =========================
+function ShortyInterrupt_Comms:BroadcastCapabilities(spells)
+  if type(spells) ~= "table" or #spells == 0 then return end
+
+  local parts = {}
+  for i = 1, #spells do
+    local id = tonumber(spells[i])
+    if id and (ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[id]) then
+      parts[#parts + 1] = tostring(id)
+    end
+  end
+  if #parts == 0 then return end
+  table.sort(parts)
+
+  -- L|v|147362,57994
+  local msg = string.format("L|%d|%s", self.VERSION, table.concat(parts, ","))
+  SendToGroup(msg)
+end
+
+function ShortyInterrupt_Comms:RequestCapabilities()
+  -- R|v
+  local msg = string.format("R|%d", self.VERSION)
+  SendToGroup(msg)
+end
+
+-- =========================
 -- Presence handshake
 -- =========================
 function ShortyInterrupt_Comms:BroadcastPresenceQuery(requestID)
@@ -91,16 +131,9 @@ end
 function ShortyInterrupt_Comms:SendPresenceAck(toPlayer, requestID)
   if not toPlayer or toPlayer == "" then return end
   if not requestID or requestID == "" then return end
-  if not C_ChatInfo or not C_ChatInfo.SendAddonMessage then return end
 
   local msg = string.format("A|%d|%s", self.VERSION, requestID)
-
-  -- Prefer ChatThrottleLib here too (safe), otherwise direct whisper
-  if ChatThrottleLib and ChatThrottleLib.SendAddonMessage then
-    ChatThrottleLib:SendAddonMessage("NORMAL", self.PREFIX, msg, "WHISPER", toPlayer)
-  else
-    C_ChatInfo.SendAddonMessage(self.PREFIX, msg, "WHISPER", toPlayer)
-  end
+  SendWhisper(msg, toPlayer)
 end
 
 -- =========================
@@ -113,7 +146,6 @@ function ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
 
   -- IMPORTANT:
   -- Do NOT restrict channels here. Presence ACK arrives via WHISPER.
-  -- ShortyRCD filters channels because it does not use WHISPER for protocol messages.
 
   -- Ignore self (handle both full and short forms)
   local myFull = FullPlayerName()
@@ -124,7 +156,39 @@ function ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
 
   local t1, t2, t3, t4 = strsplit("|", msg)
 
-  -- New protocol
+  -- Capabilities request: R|v
+  if t1 == "R" then
+    local v = tonumber(t2)
+    if v ~= self.VERSION then return end
+
+    if ShortyInterrupt and ShortyInterrupt.BroadcastMyCapabilities then
+      ShortyInterrupt:BroadcastMyCapabilities("CAPS_REQUEST")
+    end
+    return
+  end
+
+  -- Capabilities list: L|v|csv
+  if t1 == "L" then
+    local v = tonumber(t2)
+    if v ~= self.VERSION then return end
+
+    local spellIDs = {}
+    if type(t3) == "string" and t3 ~= "" then
+      for idStr in string.gmatch(t3, "([^,]+)") do
+        local id = tonumber(idStr)
+        if id and (ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[id]) then
+          spellIDs[#spellIDs + 1] = id
+        end
+      end
+    end
+
+    if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.SetRemoteCapabilities then
+      ShortyInterrupt_Tracker:SetRemoteCapabilities(sender, spellIDs)
+    end
+    return
+  end
+
+  -- New interrupt protocol: I|v|spellID|cd
   if t1 == "I" then
     local v = tonumber(t2)
     local spellID = tonumber(t3)
@@ -138,6 +202,7 @@ function ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
     return
   end
 
+  -- Presence query: Q|v|requestID
   if t1 == "Q" then
     local v = tonumber(t2)
     local requestID = t3
@@ -145,7 +210,6 @@ function ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
     if v ~= self.VERSION then return end
     if not requestID or requestID == "" then return end
 
-    -- Respond only once per requestID (avoid loops / spam)
     if not self._seenQueries[requestID] then
       self._seenQueries[requestID] = true
       self:SendPresenceAck(sender, requestID)
@@ -153,6 +217,7 @@ function ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
     return
   end
 
+  -- Presence ack: A|v|requestID
   if t1 == "A" then
     local v = tonumber(t2)
     local requestID = t3

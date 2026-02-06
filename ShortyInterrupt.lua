@@ -1,19 +1,28 @@
 -- ShortyInterrupt - ShortyInterrupt.lua
 -- Interrupt tracking via broadcasts only (NO Blizzard cooldown APIs).
 --
--- Features:
---  - Presence handshake: detect who has addon
---  - Model B UI gating: only show confirmed addon users, with short pending grace window
---  - Capability exchange: broadcast what interrupts I actually have (prevents Hunter Counter Shot + Muzzle double rows)
---  - Raid/LFR: hide UI + suppress group comms in raids (ShortyRCD owns raid-scale tracking)
+-- Rules enforced:
+--  - Never use Blizzard cooldown APIs for interrupts
+--  - Broadcast-only tracking
+--
+-- Adds:
+--  - Presence handshake (who has addon)
+--  - Capability exchange (what interrupt spells a player actually has)
+--  - Raid/LFR: suppress behavior (ShortyRCD handles raid-scale)
 
 local ADDON = ...
 local frame = CreateFrame("Frame")
 
 ShortyInterrupt = ShortyInterrupt or {}
 
+-- Forward declarations (prevents nil global calls due to definition order)
+local RequestCapabilitiesExchange
+local HandleGroupRosterUpdate
+local OnPlayerSpellcastSucceeded
+local OnPresenceAck
+
 -- =========================
--- Helpers / DB
+-- DB / helpers
 -- =========================
 local function EnsureDB()
   ShortyInterruptDB = ShortyInterruptDB or {}
@@ -53,22 +62,73 @@ local function PrintOnce(msg)
 end
 
 local function IsRaidContext()
-  -- Any raid group (including LFR) => ShortyInterrupt UI/comms disabled
+  -- Any raid group (including LFR) => ShortyInterrupt behavior suppressed
   return IsInRaid() == true
 end
 
 -- =========================
--- Presence (who has addon)
+-- #4: TX de-dupe + throttle (local-side)
+-- =========================
+-- Never delays; only suppresses duplicates.
+local _recentCastGUID = {}  -- [castGUID] = time
+local _recentSpellTX  = {}  -- [spellID]  = time
+local _lastPruneAt = 0
+
+local function PruneTXCaches(now)
+  if (now - _lastPruneAt) < 2.0 then return end
+  _lastPruneAt = now
+
+  for guid, t in pairs(_recentCastGUID) do
+    if (now - t) > 3.0 then
+      _recentCastGUID[guid] = nil
+    end
+  end
+
+  for spellID, t in pairs(_recentSpellTX) do
+    if (now - t) > 3.0 then
+      _recentSpellTX[spellID] = nil
+    end
+  end
+end
+
+local function ShouldTransmitInterrupt(castGUID, spellID)
+  local now = GetTime()
+  PruneTXCaches(now)
+
+  -- De-dupe same cast firing twice
+  if castGUID and castGUID ~= "" then
+    local last = _recentCastGUID[castGUID]
+    if last and (now - last) < 0.60 then
+      return false
+    end
+    _recentCastGUID[castGUID] = now
+  end
+
+  -- Tiny per-spell throttle (covers edge cases where castGUID differs)
+  spellID = tonumber(spellID)
+  if spellID then
+    local last = _recentSpellTX[spellID]
+    if last and (now - last) < 0.25 then
+      return false
+    end
+    _recentSpellTX[spellID] = now
+  end
+
+  return true
+end
+
+-- =========================
+-- Presence state (group session)
 -- =========================
 local Presence = {
-  roster = {},        -- [fullName] = true
-  has = {},           -- [fullName] = true
-  missing = {},       -- [fullName] = true
+  roster = {},        -- [name] = true (current roster snapshot)
+  has = {},           -- [fullName] = true (confirmed has addon)
+  missing = {},       -- [fullName] = true (we already announced missing)
   pending = nil,      -- { id=, members={...}, startedAt= }
   debounce = false,
 
-  -- Model B grace: allow showing people briefly while we wait for ACKs
-  pendingUntil = {},  -- [shortName] = expiresAt(GetTime())
+  -- Model B grace window: show briefly while waiting for ACKs
+  pendingUntil = {},  -- [shortName] = expiresAt
 }
 
 ShortyInterrupt.Presence = Presence
@@ -116,7 +176,7 @@ local function BuildRosterSnapshot()
   return members, set
 end
 
--- Avoid math.random/randomseed (restricted in some modern environments)
+-- Avoid math.random/randomseed (restricted in modern WoW sandbox sometimes)
 local _reqCounter = 0
 local function MakeRequestID()
   _reqCounter = _reqCounter + 1
@@ -171,6 +231,7 @@ local function ResolvePresenceCheck(requestID)
 
   if #missingNow > 0 then
     table.sort(missingNow)
+
     for _, fullName in ipairs(missingNow) do
       Presence.missing[fullName] = true
       Presence.pendingUntil[ShortName(fullName)] = nil
@@ -200,9 +261,7 @@ local function StartPresenceCheck(reason)
     startedAt = GetTime(),
   }
 
-  -- Model B grace
   MarkPendingGrace(members, 2.8)
-
   ShortyInterrupt_Comms:BroadcastPresenceQuery(requestID)
 
   C_Timer.After(2.5, function()
@@ -219,7 +278,7 @@ local function DebouncedPresenceCheck(reason)
   end)
 end
 
-local function OnPresenceAck(sender, requestID)
+OnPresenceAck = function(sender, requestID)
   Presence.has[sender] = true
   Presence.pendingUntil[ShortName(sender)] = nil
 
@@ -228,7 +287,7 @@ local function OnPresenceAck(sender, requestID)
   end
 end
 
--- Model B: helper for UI
+-- Optional helper for UI to decide if a row should show (Model B behavior)
 function ShortyInterrupt:ShouldShowSender(senderShort, senderFull)
   if IsRaidContext() then return false end
 
@@ -295,12 +354,11 @@ function ShortyInterrupt:BroadcastMyCapabilities(reason)
 
   local spells = self:GetMyInterruptCapabilities()
 
-  -- Update local view immediately
+  -- Update local tracker immediately (so UI can use it)
   if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.SetRemoteCapabilities then
-    ShortyInterrupt_Tracker:SetRemoteCapabilities(UnitName("player"), spells)
+    ShortyInterrupt_Tracker:SetRemoteCapabilities(FullPlayerName() or UnitName("player"), spells)
   end
 
-  -- No raid spam
   if IsRaidContext() then
     if ShortyInterrupt_UI and ShortyInterrupt_UI.Refresh then ShortyInterrupt_UI:Refresh() end
     return
@@ -312,7 +370,8 @@ function ShortyInterrupt:BroadcastMyCapabilities(reason)
   end
 end
 
-local function RequestCapabilitiesExchange(reason)
+-- FIXED: RequestCapabilitiesExchange is forward-declared above, assigned here
+RequestCapabilitiesExchange = function(reason)
   if IsRaidContext() then return end
   if not IsInGroup() then return end
   if ThrottleCapsReq(2.0) then return end
@@ -329,7 +388,7 @@ end
 -- =========================
 -- Interrupt cast handling
 -- =========================
-local function OnPlayerSpellcastSucceeded(unit, castGUID, spellID)
+OnPlayerSpellcastSucceeded = function(unit, castGUID, spellID)
   if unit ~= "player" then return end
   if not spellID then return end
   if not IsInterruptSpell(spellID) then return end
@@ -339,21 +398,31 @@ local function OnPlayerSpellcastSucceeded(unit, castGUID, spellID)
   if not cd or cd <= 0 then return end
 
   local sender = FullPlayerName() or UnitName("player")
-  ShortyInterrupt_Tracker:Start(sender, spellID, cd)
-  ShortyInterrupt_Comms:BroadcastInterrupt(spellID, cd)
+
+  -- Always start local timer immediately
+  if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.Start then
+    ShortyInterrupt_Tracker:Start(sender, spellID, cd)
+  end
+
+  -- #4: De-dupe + throttle transmission only
+  if ShouldTransmitInterrupt(castGUID, spellID) then
+    ShortyInterrupt_Comms:BroadcastInterrupt(spellID, cd)
+  end
 end
 
 -- =========================
--- Group roster changes
+-- Group roster change logic
 -- =========================
-local function HandleGroupRosterUpdate()
+HandleGroupRosterUpdate = function()
   if IsRaidContext() then
     if ShortyInterrupt_UI and ShortyInterrupt_UI.Refresh then ShortyInterrupt_UI:Refresh() end
     return
   end
 
   if not IsInGroup() then
-    ShortyInterrupt_Tracker:ClearAll()
+    if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.ClearAll then
+      ShortyInterrupt_Tracker:ClearAll()
+    end
     WipePresenceSession()
     return
   end
@@ -374,7 +443,6 @@ local function HandleGroupRosterUpdate()
     Presence.roster[name] = true
   end
 
-  -- keep pending grace updated (prevents flicker)
   MarkPendingGrace(members, 2.8)
 
   if not hasAny or newJoin then
@@ -382,13 +450,14 @@ local function HandleGroupRosterUpdate()
     RequestCapabilitiesExchange("ROSTER_CHANGE")
   end
 
+  -- keep our own caps fresh (cheap + throttled)
   if ShortyInterrupt and ShortyInterrupt.BroadcastMyCapabilities then
     ShortyInterrupt:BroadcastMyCapabilities("ROSTER_UPDATE")
   end
 end
 
 -- =========================
--- Addon messages
+-- Addon message handler
 -- =========================
 local function OnAddonMessage(prefix, msg, channel, sender)
   ShortyInterrupt_Comms:OnMessage(prefix, msg, channel, sender)
@@ -420,9 +489,10 @@ frame:SetScript("OnEvent", function(_, event, ...)
     frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 
   elseif event == "PLAYER_ENTERING_WORLD" then
+    -- If loading into an already-formed group/instance, run checks
     if IsInGroup() and not IsRaidContext() then
       DebouncedPresenceCheck("enter_world")
-      RequestCapabilitiesExchange("ENTER_WORLD")
+      RequestCapabilitiesExchange("PLAYER_ENTERING_WORLD")
     else
       if ShortyInterrupt and ShortyInterrupt.BroadcastMyCapabilities then
         ShortyInterrupt:BroadcastMyCapabilities("ENTER_WORLD_SOLO_OR_RAID")
@@ -512,7 +582,9 @@ SlashCmdList["SHORTYINT"] = function(msg)
   end
 
   if msg == "clear" then
-    ShortyInterrupt_Tracker:ClearAll()
+    if ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.ClearAll then
+      ShortyInterrupt_Tracker:ClearAll()
+    end
     print("ShortyInterrupt: timers cleared")
     return
   end

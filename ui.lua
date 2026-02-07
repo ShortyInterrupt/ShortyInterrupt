@@ -10,12 +10,22 @@
 --
 -- Raid/LFR:
 --   - Hide UI completely in any raid group (ShortyRCD owns raid-scale tracking)
+--
+-- Visibility tweak:
+--   - Normally show ONLY while in a non-raid group (party / instance party)
+--   - BUT if unlocked, allow showing while solo so you can position/resize it
+--   - When solo+unlocked, show 5 preview rows
+--
+-- Resize:
+--   - When unlocked, show a bottom-right resize grip (like ShortyRCD)
+--   - Manual drag-resize (no SetMinResize/StartSizing dependency)
+--   - Saves size to DB (ui.w/ui.h)
 
 ShortyInterrupt_UI = ShortyInterrupt_UI or {}
 local UI = ShortyInterrupt_UI
 
 -- -----------------------
--- Helpers (mirrors ShortyRCD style)
+-- Helpers
 -- -----------------------
 local function ShortName(nameWithRealm)
   if type(nameWithRealm) ~= "string" then return nameWithRealm end
@@ -49,6 +59,13 @@ local function RGBToHex(r, g, b)
   )
 end
 
+local function Clamp(v, lo, hi)
+  v = tonumber(v) or lo
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
 -- Preferred UI font (Expressway). Place at:
 -- Interface\AddOns\ShortyInterrupt\Media\Expressway.ttf
 local PREFERRED_FONT = "Interface\\AddOns\\ShortyInterrupt\\Media\\Expressway.ttf"
@@ -80,6 +97,10 @@ local function EnsureDB()
   if ui.point == nil then
     ui.point, ui.relPoint, ui.x, ui.y = "CENTER", "CENTER", 0, 0
   end
+
+  if ui.w ~= nil then ui.w = tonumber(ui.w) end
+  if ui.h ~= nil then ui.h = tonumber(ui.h) end
+
   return ui
 end
 
@@ -101,14 +122,13 @@ local function IsRaidContext()
   return IsInRaid() == true
 end
 
-local function ShouldShowFrame()
-  -- Show ONLY while in a non-raid group (party / instance party). Hide when solo or in any raid (including LFR).
+local function InGroupNonRaid()
   if IsRaidContext() then return false end
   return IsInGroup() == true
 end
 
 -- -----------------------
--- Layout constants (match ShortyRCD compact rows)
+-- Layout constants
 -- -----------------------
 local ROW_H   = 18
 local GAP_Y   = 3
@@ -118,6 +138,9 @@ local PAD_B   = 8
 
 local ICON_SZ = 16
 local BAR_H   = 16
+
+local MIN_W = 220
+local MIN_H = 90
 
 -- -----------------------
 -- Interrupts indexed by class (built once)
@@ -135,7 +158,6 @@ local function BuildInterruptsByClass()
     end
   end
 
-  -- Stable ordering within class
   for _, list in pairs(map) do
     table.sort(list, function(a, b) return a < b end)
   end
@@ -144,9 +166,9 @@ local function BuildInterruptsByClass()
 end
 
 -- -----------------------
--- Roster -> class color mapping
+-- Class mapping for roster
 -- -----------------------
-UI.classByName = UI.classByName or {} -- [shortName] = classToken
+UI.classByName = UI.classByName or {}
 
 function UI:RefreshRosterClasses()
   wipe(self.classByName)
@@ -163,14 +185,10 @@ function UI:RefreshRosterClasses()
   end
 
   if IsInRaid() then
-    for i = 1, GetNumGroupMembers() do
-      AddUnit("raid" .. i)
-    end
+    for i = 1, GetNumGroupMembers() do AddUnit("raid" .. i) end
   elseif IsInGroup() then
     AddUnit("player")
-    for i = 1, GetNumSubgroupMembers() do
-      AddUnit("party" .. i)
-    end
+    for i = 1, GetNumSubgroupMembers() do AddUnit("party" .. i) end
   else
     AddUnit("player")
   end
@@ -200,10 +218,9 @@ local function IsPendingGrace(shortName)
 end
 
 -- -----------------------
--- Interrupt selection logic (Hunter special-case)
+-- Spell selection (Hunter special case)
 -- -----------------------
 local function ChooseInterruptSpellForClass(classToken, shortName, spellList)
-  -- Hunter: default to Counter Shot unless we *know* they have Muzzle via capabilities.
   if classToken == "HUNTER" then
     local hasMuzzle = false
     local hasCounter = false
@@ -217,26 +234,113 @@ local function ChooseInterruptSpellForClass(classToken, shortName, spellList)
 
     if hasMuzzle then return 187707 end
     if hasCounter then return 147362 end
-
-    -- If we don't know yet, show Counter Shot by default (Model B requirement).
-    return 147362
+    return 147362 -- default
   end
 
-  -- Non-hunter: if only one spell, use it.
-  if spellList and #spellList == 1 then
+  if spellList and #spellList >= 1 then
     return spellList[1]
   end
-
-  -- If multiple (rare), just pick first stable.
-  if spellList and #spellList > 1 then
-    return spellList[1]
-  end
-
   return nil
 end
 
 -- -----------------------
--- Build rows: everyone with addon (or grace)
+-- Preview mode
+-- -----------------------
+function UI:IsPreviewMode()
+  if IsRaidContext() then return false end
+  local db = EnsureDB()
+  if db.locked then return false end
+  return IsInGroup() ~= true
+end
+
+local function TrimTo12(s)
+  s = tostring(s or "")
+  if #s > 12 then
+    return string.sub(s, 1, 12)
+  end
+  return s
+end
+
+function UI:BuildPreviewRows()
+  if not self.interruptsByClass then
+    self.interruptsByClass = BuildInterruptsByClass()
+  end
+
+  local playerFull = UnitName("player") or "Player"
+  local playerShort = ShortName(playerFull) or "Player"
+  playerShort = TrimTo12(playerShort)
+
+  local _, playerClass = UnitClass("player")
+  if not playerClass then playerClass = "WARRIOR" end
+
+  local playerSpell = nil
+  local list = self.interruptsByClass[playerClass]
+  if list and #list > 0 then
+    playerSpell = ChooseInterruptSpellForClass(playerClass, playerShort, list)
+  end
+  if not playerSpell then
+    for _, ids in pairs(self.interruptsByClass) do
+      if ids and ids[1] then playerSpell = ids[1]; break end
+    end
+  end
+
+  local samples = {
+    { name = "Aeloria",  class = "MAGE",        spell = 2139,   rem = 9,  dur = 25 },
+    { name = "Korrigan", class = "WARRIOR",     spell = 6552,   rem = 6,  dur = 15 },
+    { name = "Mirella",  class = "PRIEST",      spell = 15487,  rem = 18, dur = 30 },
+    { name = "Threx",    class = "DEMONHUNTER", spell = 183752, rem = 4,  dur = 15 },
+  }
+
+  for _, s in ipairs(samples) do
+    if not (ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[s.spell]) then
+      local l = self.interruptsByClass[s.class]
+      if l and l[1] then s.spell = l[1] end
+    end
+  end
+
+  -- Prime class colors so bars color correctly
+  self.classByName[playerShort] = playerClass
+  for _, s in ipairs(samples) do
+    self.classByName[TrimTo12(s.name)] = s.class
+  end
+
+  local out = {}
+
+  do
+    local sid = playerSpell or 6552
+    local entry = ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[sid]
+    local spellName = entry and entry.name or "Interrupt"
+    out[#out+1] = {
+      sender = playerShort,
+      spellID = sid,
+      classToken = playerClass,
+      preview = true,
+      previewDuration = 15,
+      previewRemaining = 7,
+      previewLabel = playerShort .. "  |cff9aa7b2" .. spellName .. "|r",
+    }
+  end
+
+  for _, s in ipairs(samples) do
+    local n = TrimTo12(s.name)
+    local entry = ShortyInterrupt_Interrupts and ShortyInterrupt_Interrupts[s.spell]
+    local spellName = entry and entry.name or "Interrupt"
+    out[#out+1] = {
+      sender = n,
+      spellID = s.spell,
+      classToken = s.class,
+      preview = true,
+      previewDuration = s.dur,
+      previewRemaining = s.rem,
+      previewLabel = n .. "  |cff9aa7b2" .. spellName .. "|r",
+    }
+  end
+
+  return out
+end
+
+-- -----------------------
+-- Real rows (group/party)
 -- -----------------------
 function UI:BuildRosterInterruptRows()
   if not self.interruptsByClass then
@@ -251,7 +355,6 @@ function UI:BuildRosterInterruptRows()
     local short = ShortName(fullName)
     if not short then return end
 
-    -- Model B: hide players who don't have addon (unless in pending grace window)
     if not isPlayer then
       if not IsKnownAddonUser(short) and not IsPendingGrace(short) then
         return
@@ -264,7 +367,6 @@ function UI:BuildRosterInterruptRows()
     local chosen = ChooseInterruptSpellForClass(classToken, short, spellList)
     if not chosen then return end
 
-    -- For SELF only, filter by known spells (optional sanity)
     if isPlayer then
       local ok = true
       if IsPlayerSpell then
@@ -324,7 +426,7 @@ function UI:BuildRosterInterruptRows()
 end
 
 -- -----------------------
--- Read current cooldown state from tracker (if present)
+-- Cooldown state
 -- -----------------------
 local function GetCooldownState(senderShort, spellID)
   if not (ShortyInterrupt_Tracker and ShortyInterrupt_Tracker.active) then
@@ -350,13 +452,42 @@ local function GetCooldownState(senderShort, spellID)
 end
 
 -- -----------------------
--- Frame creation (ShortyRCD theme)
+-- Visibility
+-- -----------------------
+function UI:UpdateVisibility()
+  if not self.frame then return end
+  local db = EnsureDB()
+
+  if IsRaidContext() then
+    if self.frame:IsShown() then self.frame:Hide() end
+    return
+  end
+
+  if InGroupNonRaid() then
+    if not self.frame:IsShown() then self.frame:Show() end
+    return
+  end
+
+  if db.locked == false then
+    if not self.frame:IsShown() then self.frame:Show() end
+  else
+    if self.frame:IsShown() then self.frame:Hide() end
+  end
+end
+
+-- -----------------------
+-- Create frame
 -- -----------------------
 function UI:Create()
   if self.frame then return end
-  EnsureDB()
+  local db = EnsureDB()
 
   self.rows = {}
+  self._isResizing = false
+  self._resizeStartX = nil
+  self._resizeStartY = nil
+  self._resizeStartW = nil
+  self._resizeStartH = nil
 
   local f = CreateFrame("Frame", "ShortyInterrupt_Frame", UIParent, "BackdropTemplate")
   f:SetSize(260, 140)
@@ -393,6 +524,7 @@ function UI:Create()
 
   f:SetScript("OnDragStart", function()
     if ShortyInterruptDB and ShortyInterruptDB.ui and ShortyInterruptDB.ui.locked then return end
+    if UI._isResizing then return end
     f:StartMoving()
   end)
   f:SetScript("OnDragStop", function()
@@ -405,12 +537,80 @@ function UI:Create()
   list:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD_L, PAD_B)
   list:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD_R, -36)
 
+  -- Resize grip (manual resize; no StartSizing dependency)
+  local grip = CreateFrame("Button", nil, f)
+  grip:SetSize(16, 16)
+  grip:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -2, 2)
+  grip:EnableMouse(true)
+
+  local tex = grip:CreateTexture(nil, "OVERLAY")
+  tex:SetAllPoints()
+  tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+  grip.tex = tex
+
+  grip:SetScript("OnEnter", function()
+    local db2 = EnsureDB()
+    if db2.locked then return end
+    grip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+  end)
+
+  grip:SetScript("OnLeave", function()
+    local db2 = EnsureDB()
+    if db2.locked then return end
+    grip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+  end)
+
+  grip:SetScript("OnMouseDown", function(_, btn)
+    if btn ~= "LeftButton" then return end
+    local db2 = EnsureDB()
+    if db2.locked then return end
+
+    UI._isResizing = true
+    grip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+
+    local scale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+    local x, y = GetCursorPosition()
+    x, y = x / scale, y / scale
+
+    UI._resizeStartX = x
+    UI._resizeStartY = y
+    UI._resizeStartW = f:GetWidth()
+    UI._resizeStartH = f:GetHeight()
+  end)
+
+  grip:SetScript("OnMouseUp", function(_, btn)
+    if btn ~= "LeftButton" then return end
+    if not UI._isResizing then return end
+
+    UI._isResizing = false
+
+    local maxW = GetMaxScreenWidth()
+    local maxH = GetMaxScreenHeight()
+
+    local db2 = EnsureDB()
+    db2.w = Clamp(f:GetWidth(), MIN_W, maxW)
+    db2.h = Clamp(f:GetHeight(), MIN_H, maxH)
+
+    UI:SavePosition()
+    UI:UpdateBoard()
+
+    if not db2.locked then
+      grip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    end
+  end)
+
   self.frame = f
   self.header = header
   self.title = title
   self.list = list
+  self.resizeGrip = grip
 
   self:RestorePosition()
+
+  if db.w and db.h then
+    f:SetSize(Clamp(db.w, MIN_W, GetMaxScreenWidth()), Clamp(db.h, MIN_H, GetMaxScreenHeight()))
+  end
+
   self:ApplyLockState()
 
   f:SetScript("OnEvent", function(_, event)
@@ -430,8 +630,33 @@ function UI:Create()
     self:RefreshRosterClasses()
   end
 
+  -- One OnUpdate loop does both:
+  -- - resizing when active
+  -- - normal UI refresh tick when not resizing
   self.accum = 0
   f:SetScript("OnUpdate", function(_, elapsed)
+    -- Manual resize live-update (prevents snap-back)
+    if UI._isResizing then
+      local scale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+      local x, y = GetCursorPosition()
+      x, y = x / scale, y / scale
+
+      local dx = x - (UI._resizeStartX or x)
+      local dy = (UI._resizeStartY or y) - y -- drag down increases height
+
+      local startW = UI._resizeStartW or f:GetWidth()
+      local startH = UI._resizeStartH or f:GetHeight()
+
+      local maxW = GetMaxScreenWidth()
+      local maxH = GetMaxScreenHeight()
+
+      local newW = Clamp(startW + dx, MIN_W, maxW)
+      local newH = Clamp(startH + dy, MIN_H, maxH)
+
+      f:SetSize(newW, newH)
+      return
+    end
+
     UI.accum = UI.accum + elapsed
     if UI.accum >= 0.10 then
       UI.accum = 0
@@ -444,24 +669,7 @@ function UI:Create()
 end
 
 -- -----------------------
--- Visibility
--- -----------------------
-function UI:UpdateVisibility()
-  if not self.frame then return end
-
-  if ShouldShowFrame() then
-    if not self.frame:IsShown() then
-      self.frame:Show()
-    end
-  else
-    if self.frame:IsShown() then
-      self.frame:Hide()
-    end
-  end
-end
-
--- -----------------------
--- Row pool (matches ShortyRCD item row style)
+-- Row pool
 -- -----------------------
 function UI:EnsureRow(i)
   if self.rows[i] then return self.rows[i] end
@@ -470,7 +678,6 @@ function UI:EnsureRow(i)
   local r = CreateFrame("Frame", nil, parent)
   r:SetSize(220, ROW_H)
 
-  -- background (item)
   local bg = CreateFrame("Frame", nil, r, "BackdropTemplate")
   bg:SetPoint("TOPLEFT", r, "TOPLEFT", 0, 0)
   bg:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", 0, 0)
@@ -483,13 +690,11 @@ function UI:EnsureRow(i)
   bg:SetBackdropColor(0.05, 0.06, 0.08, 0.55)
   bg:SetBackdropBorderColor(0.12, 0.13, 0.16, 0.9)
 
-  -- icon
   local icon = r:CreateTexture(nil, "ARTWORK")
   icon:SetSize(ICON_SZ, ICON_SZ)
   icon:SetPoint("LEFT", r, "LEFT", 4, 0)
   icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-  -- bar background
   local barBG = CreateFrame("Frame", nil, r, "BackdropTemplate")
   barBG:SetPoint("LEFT", icon, "RIGHT", 6, 0)
   barBG:SetPoint("RIGHT", r, "RIGHT", -4, 0)
@@ -546,22 +751,34 @@ function UI:UpdateBoard()
   if not self.frame then return end
   if not ShortyInterrupt_Interrupts then return end
 
-  -- Auto-hide when solo or in any raid (including LFR)
   self:UpdateVisibility()
-  if not (self.frame and self.frame:IsShown()) then
-    return
-  end
+  if not (self.frame and self.frame:IsShown()) then return end
 
-  local rosterRows = self:BuildRosterInterruptRows()
+  local previewMode = self:IsPreviewMode()
+  local rosterRows = previewMode and self:BuildPreviewRows() or self:BuildRosterInterruptRows()
 
   local maxW = GetMaxScreenWidth()
   local maxH = GetMaxScreenHeight()
 
-  local desiredW = 260
-  local desiredH = 28 + 8 + PAD_B + math.max(1, #rosterRows) * (ROW_H + GAP_Y)
-  desiredH = math.min(maxH, math.max(90, desiredH))
-  desiredW = math.min(maxW, math.max(220, desiredW))
-  self.frame:SetSize(desiredW, desiredH)
+  local autoW = 260
+  local autoH = 28 + 8 + PAD_B + math.max(1, #rosterRows) * (ROW_H + GAP_Y)
+  autoH = math.min(maxH, math.max(MIN_H, autoH))
+  autoW = math.min(maxW, math.max(MIN_W, autoW))
+
+  local db = EnsureDB()
+
+  -- Only force sizing when NOT actively resizing
+  if not self._isResizing then
+    local desiredW = autoW
+    local desiredH = autoH
+
+    if db.w and db.h then
+      desiredW = Clamp(db.w, MIN_W, maxW)
+      desiredH = Clamp(db.h, MIN_H, maxH)
+    end
+
+    self.frame:SetSize(desiredW, desiredH)
+  end
 
   local y = 0
   for i = 1, #rosterRows do
@@ -576,9 +793,14 @@ function UI:UpdateBoard()
     local sender = d.sender or "?"
     local cr, cg, cb = self:GetClassColorForSender(sender)
     local senderHex = RGBToHex(cr, cg, cb)
-    local senderText = ("|cff%s%s|r"):format(senderHex, sender)
 
-    -- Icon for this interrupt spell
+    local labelText
+    if previewMode and d.previewLabel then
+      labelText = ("|cff%s%s|r"):format(senderHex, d.previewLabel)
+    else
+      labelText = ("|cff%s%s|r"):format(senderHex, sender)
+    end
+
     local entry = ShortyInterrupt_Interrupts[d.spellID]
     local iconID = entry and entry.iconID
     if iconID then
@@ -587,8 +809,12 @@ function UI:UpdateBoard()
       r.icon:SetTexture("Interface/Icons/INV_Misc_QuestionMark")
     end
 
-    -- Determine cooldown state: if none => READY/full bar
-    local st = GetCooldownState(sender, d.spellID)
+    local st
+    if previewMode and d.preview then
+      st = { duration = tonumber(d.previewDuration) or 15, remaining = tonumber(d.previewRemaining) or 7 }
+    else
+      st = GetCooldownState(sender, d.spellID)
+    end
 
     local progress = 1
     local remaining = 0
@@ -597,7 +823,6 @@ function UI:UpdateBoard()
     if st then
       total = st.duration > 0 and st.duration or 1
       remaining = st.remaining > 0 and st.remaining or 0
-      -- "Drains" as remaining decreases: 1 -> 0
       progress = math.max(0, math.min(1, remaining / total))
     else
       progress = 1
@@ -605,18 +830,15 @@ function UI:UpdateBoard()
 
     r.bar:SetMinMaxValues(0, 1)
     r.bar:SetValue(progress)
-
-    -- Full class color always
     r.bar:SetStatusBarColor(cr, cg, cb, 0.90)
 
-    r.label:SetText(senderText)
+    r.label:SetText(labelText)
     r.label:SetTextColor(0.78, 0.80, 0.84, 1.0)
 
     if st then
       r.timer:SetText(FormatTime(remaining))
       r.timer:SetTextColor(0.90, 0.92, 0.96, 1.0)
     else
-      -- READY: full bar, no text
       r.timer:SetText("")
     end
 
@@ -636,6 +858,15 @@ function UI:UpdateBoard()
     self:HideExtraRows(2)
   else
     self:HideExtraRows(#rosterRows + 1)
+  end
+
+  -- Resize grip visibility
+  if self.resizeGrip then
+    if db.locked then
+      self.resizeGrip:Hide()
+    else
+      if self.frame:IsShown() then self.resizeGrip:Show() else self.resizeGrip:Hide() end
+    end
   end
 end
 
@@ -678,6 +909,8 @@ function UI:SetLocked(locked)
   local db = EnsureDB()
   db.locked = (locked == true)
   self:ApplyLockState()
+  self:UpdateVisibility()
+  self:UpdateBoard()
 end
 
 function UI:ApplyLockState()
@@ -686,6 +919,24 @@ function UI:ApplyLockState()
   local locked = db.locked == true
 
   self.frame:EnableMouse(not locked)
+
+  if self.resizeGrip then
+    if locked then
+      self.resizeGrip:Hide()
+      if self.resizeGrip.tex then
+        self.resizeGrip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+      end
+    else
+      if self.frame:IsShown() then
+        self.resizeGrip:Show()
+      else
+        self.resizeGrip:Hide()
+      end
+      if self.resizeGrip.tex then
+        self.resizeGrip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+      end
+    end
+  end
 
   if locked then
     self.frame:SetBackdropColor(0.07, 0.08, 0.10, 0.00)
